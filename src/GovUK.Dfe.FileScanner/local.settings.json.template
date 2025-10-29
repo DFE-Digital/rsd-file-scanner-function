@@ -4,10 +4,11 @@
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
     "ASPNETCORE_ENVIRONMENT": "Development",
-    "ServiceBusConnection": "Endpoint=sb://YOUR-NAMESPACE.servicebus.windows.net/;SharedAccessKeyName=YOUR-KEY-NAME;SharedAccessKey=YOUR-KEY",
+    "ServiceBus": "Endpoint=sb://YOUR-NAMESPACE.servicebus.windows.net/;SharedAccessKeyName=YOUR-KEY-NAME;SharedAccessKey=YOUR-KEY;TransportType=AmqpWebSockets",
     "TOPIC_NAME": "scan-requests",
     "SUBSCRIPTION_NAME": "file-scanner-function-app",
-    "RESULTS_TOPIC_NAME": "scan-results"
+    "RESULTS_TOPIC_NAME": "scan-results",
+    "VirusScannerApi:BaseUrl": "https://your-virus-scanner-api-url.com"
   },
   "ConnectionStrings": {
     "Redis": "localhost:6379,abortConnect=false",
