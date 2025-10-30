@@ -253,13 +253,32 @@ public class FileScanner(
         {
             logger.LogInformation("Downloading file from: {FileUri}", fileUri);
 
-            var response = await _httpClient.GetAsync(fileUri, cancellationToken);
-            response.EnsureSuccessStatusCode();
+            var fUri = new Uri(fileUri);
 
-            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
-            logger.LogInformation("Downloaded {Length} bytes from {FileUri}", bytes.Length, fileUri);
 
-            return bytes;
+            byte[] fileBytes;
+
+            if (fUri.Scheme.Equals("file", StringComparison.OrdinalIgnoreCase))
+            {
+                // Local mode: read directly from disk
+                var localPath = fUri.LocalPath;
+                fileBytes = await File.ReadAllBytesAsync(localPath, cancellationToken);
+                Console.WriteLine($"[LOCAL] Loaded file from {localPath}");
+            }
+            else
+            {
+                // Azure mode: download via SAS (HTTPS)
+                var response = await _httpClient.GetAsync(fUri, cancellationToken);
+                response.EnsureSuccessStatusCode();
+
+                fileBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+                Console.WriteLine($"[AZURE] Downloaded file from {fUri}");
+            }
+
+
+            logger.LogInformation("Downloaded {Length} bytes from {FileUri}", fileBytes.Length, fUri);
+
+            return fileBytes;
         }
         catch (HttpRequestException ex)
         {
