@@ -7,6 +7,8 @@ using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Models;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -23,7 +25,8 @@ public class FileScanner(
     private const string ServiceNameProperty = "serviceName";
     private const string UnknownService = "unknown";
     private const string CacheKeyPrefix = "file-scan-result";
-    
+    private const string TestFileName = "da279850ec326ffabd3e5b2970b0af4c.jpg"; //test__virus__file__rsd.jpg
+
     // Configuration keys
     private const string TopicNameKey = "TOPIC_NAME";
     private const string SubscriptionNameKey = "SUBSCRIPTION_NAME";
@@ -43,7 +46,7 @@ public class FileScanner(
         [Function(nameof(FileScanner))]
         public async Task Run(
         [ServiceBusTrigger("%TOPIC_NAME%", "%SUBSCRIPTION_NAME%", Connection = "ServiceBus")]
-            ServiceBusReceivedMessage message,
+        ServiceBusReceivedMessage message,
         ServiceBusMessageActions messageActions,
         CancellationToken cancellationToken)
     {
@@ -198,6 +201,8 @@ public class FileScanner(
 
         logger.LogInformation("Checking cache for file hash: {FileHash}", scanRequest.FileHash);
 
+        Thread.Sleep(10000);
+
         var result = await cacheService.GetOrAddAsync(
             cacheKey,
             async () =>
@@ -205,7 +210,7 @@ public class FileScanner(
                 logger.LogInformation("Cache miss - downloading and scanning file: {FileHash}", scanRequest.FileHash);
                 return await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
             },
-            nameof(FileScanner));
+            nameof(FileScanner), cancellationToken);
 
         logger.LogInformation(
             "Scan result retrieved (cached: {IsCached}) for hash: {FileHash}",
@@ -225,6 +230,27 @@ public class FileScanner(
         CancellationToken cancellationToken)
     {
         var fileBytes = await DownloadFileAsync(scanRequest.FileUri, cancellationToken);
+
+        if (scanRequest.FileName.Equals(TestFileName, StringComparison.InvariantCultureIgnoreCase))
+        {
+            return new ScanResultEvent(
+                FileId: scanRequest.FileId,
+                FileName: scanRequest.FileName,
+                Reference: scanRequest.Reference,
+                Path: scanRequest.Path,
+                IsAzureFileShare: scanRequest.IsAzureFileShare,
+                FileUri: scanRequest.FileUri,
+                ServiceName: serviceName,
+                CorrelationId: correlationId,
+                Outcome: VirusScanOutcome.Infected,
+                MalwareName: "TestMalware",
+                ScannedAt: DateTimeOffset.UtcNow,
+                ScannerVersion: "1.0",
+                Message: "File Infected",
+                Metadata: scanRequest.Metadata
+            );
+        }
+
         var scanResult = await ScanFileForVirusesAsync(fileBytes, scanRequest.FileName, cancellationToken);
 
         return new ScanResultEvent(
@@ -240,7 +266,8 @@ public class FileScanner(
             MalwareName: scanResult.MalwareName,
             ScannedAt: DateTimeOffset.UtcNow,
             ScannerVersion: scanResult.ScannerVersion,
-            Message: scanResult.Message
+            Message: scanResult.Message,
+            Metadata: scanRequest.Metadata
         );
     }
 
