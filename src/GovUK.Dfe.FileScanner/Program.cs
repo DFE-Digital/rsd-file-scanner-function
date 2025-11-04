@@ -1,6 +1,7 @@
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Entities.Topics;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Events;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Extensions;
+using MassTransit;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -32,6 +33,7 @@ var host = new HostBuilder()
             },
             configureBus: (context, cfg) =>
             {
+                cfg.UseJsonSerializer();
                 // Configure message routing for publishing
                 cfg.Message<ScanResultEvent>(m => m.SetEntityName(TopicNames.ScanResult));
             });

@@ -201,7 +201,7 @@ public class FileScanner(
 
         logger.LogInformation("Checking cache for file hash: {FileHash}", scanRequest.FileHash);
 
-        Thread.Sleep(10000);
+        await Task.Delay(5000, cancellationToken);
 
         var result = await cacheService.GetOrAddAsync(
             cacheKey,
