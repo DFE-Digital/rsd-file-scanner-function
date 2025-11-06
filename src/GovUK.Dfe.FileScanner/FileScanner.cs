@@ -31,14 +31,17 @@ public class FileScanner(
     private const string TopicNameKey = "TOPIC_NAME";
     private const string SubscriptionNameKey = "SUBSCRIPTION_NAME";
     private const string VirusScannerApiBaseUrlKey = "VirusScannerApi:BaseUrl";
+    private const string VirusScannerApiSyncScanEndpointKey = "VirusScannerApi:SyncScanEndpoint";
     private const string VirusScannerApiAsyncScanEndpointKey = "VirusScannerApi:AsyncScanEndpoint";
     private const string VirusScannerApiVersionEndpointKey = "VirusScannerApi:VersionEndpoint";
     private const string VirusScannerApiPollingIntervalSecondsKey = "VirusScannerApi:PollingIntervalSeconds";
     private const string VirusScannerApiMaxPollingTimeoutSecondsKey = "VirusScannerApi:MaxPollingTimeoutSeconds";
+    private const string VirusScannerApiAsyncThresholdBytesKey = "VirusScannerApi:AsyncThresholdBytes";
     
-    // Default values for async scanning
+    // Default values for scanning
     private const int DefaultPollingIntervalSeconds = 5;
     private const int DefaultMaxPollingTimeoutSeconds = 300; // 5 minutes
+    private const int DefaultAsyncThresholdBytes = 5 * 1024 * 1024; // 5 MB
 
     // Static configuration
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -326,9 +329,151 @@ public class FileScanner(
     }
 
     /// <summary>
-    /// Scans a file for viruses using the virus scanner API with async scanning and polling.
+    /// Scans a file for viruses using the appropriate method based on file size.
+    /// Small files use sync scanning, large files use async scanning with polling.
     /// </summary>
     private async Task<VirusScanResult> ScanFileForVirusesAsync(
+        byte[] fileBytes,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
+        var asyncThreshold = configuration.GetValue<int?>(VirusScannerApiAsyncThresholdBytesKey) ?? DefaultAsyncThresholdBytes;
+        var fileSizeBytes = fileBytes.Length;
+        
+        logger.LogInformation(
+            "File size: {FileSize} bytes ({FileSizeMB:F2} MB). Async threshold: {Threshold} bytes ({ThresholdMB:F2} MB)",
+            fileSizeBytes,
+            fileSizeBytes / (1024.0 * 1024.0),
+            asyncThreshold,
+            asyncThreshold / (1024.0 * 1024.0));
+        
+        if (fileSizeBytes > asyncThreshold)
+        {
+            logger.LogInformation("Using ASYNC scan method for large file: {FileName}", fileName);
+            return await ScanFileAsyncMethodAsync(fileBytes, fileName, cancellationToken);
+        }
+        else
+        {
+            logger.LogInformation("Using SYNC scan method for small file: {FileName}", fileName);
+            return await ScanFileSyncMethodAsync(fileBytes, fileName, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Scans a file using synchronous scanning (immediate result).
+    /// </summary>
+    private async Task<VirusScanResult> ScanFileSyncMethodAsync(
+        byte[] fileBytes,
+        string fileName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var baseUrl = configuration[VirusScannerApiBaseUrlKey];
+            var syncScanEndpoint = configuration[VirusScannerApiSyncScanEndpointKey] ?? "/scan";
+            var versionEndpoint = configuration[VirusScannerApiVersionEndpointKey] ?? "/version";
+            
+            if (string.IsNullOrWhiteSpace(baseUrl))
+            {
+                logger.LogError("Virus scanner API base URL is not configured");
+                return new VirusScanResult
+                {
+                    Outcome = VirusScanOutcome.Error,
+                    MalwareName = null,
+                    ScannerVersion = "Unknown",
+                    Message = "Virus scanner API not configured"
+                };
+            }
+
+            logger.LogInformation("Scanning file synchronously: {FileName} ({Size} bytes) using API: {BaseUrl}", 
+                fileName, fileBytes.Length, baseUrl);
+
+            // Get scanner version
+            var scannerVersion = await GetScannerVersionAsync(baseUrl, versionEndpoint, cancellationToken);
+
+            // Scan the file synchronously
+            var scanUrl = $"{baseUrl.TrimEnd('/')}{syncScanEndpoint}";
+            using var content = new MultipartFormDataContent();
+            using var fileContent = new ByteArrayContent(fileBytes);
+            fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+            content.Add(fileContent, "file", fileName);
+
+            var response = await _httpClient.PostAsync(scanUrl, content, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+            var scanResponse = JsonSerializer.Deserialize<VirusScanApiResponse>(responseBody, JsonOptions);
+
+            if (scanResponse == null)
+            {
+                logger.LogError("Failed to parse virus scan response");
+                return new VirusScanResult
+                {
+                    Outcome = VirusScanOutcome.Error,
+                    MalwareName = null,
+                    ScannerVersion = scannerVersion,
+                    Message = "Failed to parse scan response"
+                };
+            }
+
+            logger.LogInformation("Sync scan completed for {FileName}. Result: {Status}", fileName, scanResponse.Status);
+
+            var outcome = MapScanOutcome(scanResponse.Status);
+            var message = outcome switch
+            {
+                VirusScanOutcome.Clean => $"File is clean. Engine: {scanResponse.Engine}",
+                VirusScanOutcome.Infected => $"Malware detected: {scanResponse.Malware}",
+                VirusScanOutcome.Error => $"Scan error: {scanResponse.Raw ?? "Unknown error"}",
+                _ => "Scan completed"
+            };
+
+            return new VirusScanResult
+            {
+                Outcome = outcome,
+                MalwareName = scanResponse.Malware,
+                ScannerVersion = scannerVersion,
+                Message = message
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            logger.LogError(ex, "HTTP error calling virus scanner API (sync) for file: {FileName}", fileName);
+            return new VirusScanResult
+            {
+                Outcome = VirusScanOutcome.Error,
+                MalwareName = null,
+                ScannerVersion = "Unknown",
+                Message = $"Virus scanner API error: {ex.Message}"
+            };
+        }
+        catch (TaskCanceledException ex)
+        {
+            logger.LogError(ex, "Virus scan timeout (sync) for file: {FileName}", fileName);
+            return new VirusScanResult
+            {
+                Outcome = VirusScanOutcome.Error,
+                MalwareName = null,
+                ScannerVersion = "Unknown",
+                Message = "Virus scan timeout"
+            };
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error scanning file (sync): {FileName}", fileName);
+            return new VirusScanResult
+            {
+                Outcome = VirusScanOutcome.Error,
+                MalwareName = null,
+                ScannerVersion = "Unknown",
+                Message = $"Scan failed: {ex.Message}"
+            };
+        }
+    }
+
+    /// <summary>
+    /// Scans a file using asynchronous scanning with polling (for large files).
+    /// </summary>
+    private async Task<VirusScanResult> ScanFileAsyncMethodAsync(
         byte[] fileBytes,
         string fileName,
         CancellationToken cancellationToken)
@@ -425,7 +570,7 @@ public class FileScanner(
         }
         catch (HttpRequestException ex)
         {
-            logger.LogError(ex, "HTTP error calling virus scanner API for file: {FileName}", fileName);
+            logger.LogError(ex, "HTTP error calling virus scanner API (async) for file: {FileName}", fileName);
             return new VirusScanResult
             {
                 Outcome = VirusScanOutcome.Error,
@@ -436,7 +581,7 @@ public class FileScanner(
         }
         catch (TaskCanceledException ex)
         {
-            logger.LogError(ex, "Virus scan timeout for file: {FileName}", fileName);
+            logger.LogError(ex, "Virus scan timeout (async) for file: {FileName}", fileName);
             return new VirusScanResult
             {
                 Outcome = VirusScanOutcome.Error,
@@ -447,7 +592,7 @@ public class FileScanner(
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error scanning file: {FileName}", fileName);
+            logger.LogError(ex, "Error scanning file (async): {FileName}", fileName);
             return new VirusScanResult
             {
                 Outcome = VirusScanOutcome.Error,
