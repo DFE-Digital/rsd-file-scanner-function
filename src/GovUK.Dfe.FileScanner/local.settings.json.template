@@ -4,15 +4,23 @@
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
     "ASPNETCORE_ENVIRONMENT": "Development",
-    "ServiceBus": "Endpoint=sb://YOUR-NAMESPACE.servicebus.windows.net/;SharedAccessKeyName=YOUR-KEY-NAME;SharedAccessKey=YOUR-KEY;TransportType=AmqpWebSockets",
-    "TOPIC_NAME": "scan-requests",
+    "TOPIC_NAME": "file-scanner-requests",
     "SUBSCRIPTION_NAME": "file-scanner-function-app",
-    "RESULTS_TOPIC_NAME": "scan-results",
-    "VirusScannerApi:BaseUrl": "https://your-virus-scanner-api-url.com"
+    "RESULTS_TOPIC_NAME": "file-scanner-results",
+    "VirusScannerApi:BaseUrl": "https://your-virus-scanner-api-url.com",
+    "VirusScannerApi:AsyncScanUrlEndpoint": "/scan/async/url",
+    "VirusScannerApi:VersionEndpoint": "/version",
+    "VirusScannerApi:PollingIntervalSeconds": "5",
+    "VirusScannerApi:MaxPollingTimeoutSeconds": "300",
+    "MassTransit:Transport": "AzureServiceBus",
+    "MassTransit:AppPrefix": "",
+    "MassTransit:AzureServiceBus:ConnectionString": "<secret>",
+    "MassTransit:AzureServiceBus:AutoCreateEntities": false,
+    "MassTransit:AzureServiceBus:ConfigureEndpoints": false,
+    "MassTransit:AzureServiceBus:UseWebSockets": true
   },
   "ConnectionStrings": {
     "Redis": "localhost:6379,abortConnect=false",
     "ServiceBus": "Endpoint=sb://YOUR-NAMESPACE.servicebus.windows.net/;SharedAccessKeyName=YOUR-KEY-NAME;SharedAccessKey=YOUR-KEY"
   }
 }
-

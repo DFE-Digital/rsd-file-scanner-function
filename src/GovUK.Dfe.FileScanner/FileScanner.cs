@@ -4,41 +4,34 @@ using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Enums;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Events;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Interfaces;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Models;
+using GovUK.Dfe.FileScanner.Models;
+using GovUK.Dfe.FileScanner.Services;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace GovUK.Dfe.FileScanner;
 
+/// <summary>
+/// Azure Function for scanning uploaded files for viruses.
+/// </summary>
 public class FileScanner(
     ILogger<FileScanner> logger,
     IEventPublisher eventPublisher,
-    IHttpClientFactory httpClientFactory,
     ICacheService<IRedisCacheType> cacheService,
+    IVirusScannerService virusScannerService,
     IConfiguration configuration)
 {
     // Constants
     private const string ServiceNameProperty = "serviceName";
     private const string UnknownService = "unknown";
     private const string CacheKeyPrefix = "file-scan-result";
-    private const string TestFileName = "da279850ec326ffabd3e5b2970b0af4c.jpg"; //test__virus__file__rsd.jpg
+    private const string TestFileName = "da279850ec326ffabd3e5b2970b0af4c.jpg";
 
     // Configuration keys
     private const string TopicNameKey = "TOPIC_NAME";
     private const string SubscriptionNameKey = "SUBSCRIPTION_NAME";
-    private const string VirusScannerApiBaseUrlKey = "VirusScannerApi:BaseUrl";
-    private const string VirusScannerApiAsyncScanEndpointKey = "VirusScannerApi:AsyncScanEndpoint";
-    private const string VirusScannerApiVersionEndpointKey = "VirusScannerApi:VersionEndpoint";
-    private const string VirusScannerApiPollingIntervalSecondsKey = "VirusScannerApi:PollingIntervalSeconds";
-    private const string VirusScannerApiMaxPollingTimeoutSecondsKey = "VirusScannerApi:MaxPollingTimeoutSeconds";
-    
-    // Default values for scanning
-    private const int DefaultPollingIntervalSeconds = 5;
-    private const int DefaultMaxPollingTimeoutSeconds = 300; // 5 minutes
 
     // Static configuration
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -47,10 +40,11 @@ public class FileScanner(
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    private readonly HttpClient _httpClient = httpClientFactory.CreateClient();
-
-        [Function(nameof(FileScanner))]
-        public async Task Run(
+    /// <summary>
+    /// Azure Function entry point triggered by Service Bus messages.
+    /// </summary>
+    [Function(nameof(FileScanner))]
+    public async Task Run(
         [ServiceBusTrigger("%TOPIC_NAME%", "%SUBSCRIPTION_NAME%", Connection = "ServiceBus")]
         ServiceBusReceivedMessage message,
         ServiceBusMessageActions messageActions,
@@ -121,31 +115,24 @@ public class FileScanner(
     {
         try
         {
-            var messageBodyJson = message.Body.ToString();
-            var wrapper = JsonSerializer.Deserialize<MessageWrapper>(messageBodyJson, JsonOptions);
+            var messageBody = message.Body.ToString();
+            logger.LogDebug("Raw message body: {MessageBody}", messageBody);
 
-            if (wrapper?.Message is null)
+            var wrapper = JsonSerializer.Deserialize<MessageWrapper>(messageBody, JsonOptions);
+            var scanRequest = wrapper?.Message;
+
+            if (scanRequest == null)
             {
-                await DeadLetterAsync(
-                    messageActions,
-                    message,
-                    "DeserializationFailed",
-                    "Message body is null or missing 'message' property",
-                    cancellationToken);
+                await DeadLetterAsync(message, messageActions, "Failed to deserialize message body", cancellationToken);
                 return null;
             }
 
-            return wrapper.Message;
+            return scanRequest;
         }
         catch (JsonException ex)
         {
-            logger.LogError(ex, "Failed to deserialize message {MessageId}", message.MessageId);
-            await DeadLetterAsync(
-                messageActions,
-                message,
-                "InvalidJson",
-                $"Invalid JSON format: {ex.Message}",
-                cancellationToken);
+            logger.LogError(ex, "JSON deserialization error for message {MessageId}", message.MessageId);
+            await DeadLetterAsync(message, messageActions, $"Invalid JSON: {ex.Message}", cancellationToken);
             return null;
         }
     }
@@ -159,25 +146,15 @@ public class FileScanner(
         ServiceBusMessageActions messageActions,
         CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(scanRequest.FileHash))
+        if (string.IsNullOrWhiteSpace(scanRequest.FileUri))
         {
-            await DeadLetterAsync(
-                messageActions,
-                message,
-                "ValidationFailed",
-                "FileHash is required but was null or empty",
-                cancellationToken);
+            await DeadLetterAsync(message, messageActions, "FileUri is missing", cancellationToken);
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(scanRequest.FileUri))
+        if (string.IsNullOrWhiteSpace(scanRequest.FileHash))
         {
-            await DeadLetterAsync(
-                messageActions,
-                message,
-                "ValidationFailed",
-                "FileUri is required but was null or empty",
-                cancellationToken);
+            await DeadLetterAsync(message, messageActions, "FileHash is missing", cancellationToken);
             return false;
         }
 
@@ -187,11 +164,17 @@ public class FileScanner(
     /// <summary>
     /// Extracts the service name from message application properties.
     /// </summary>
-    private static string ExtractServiceName(ServiceBusReceivedMessage message)
+    private string ExtractServiceName(ServiceBusReceivedMessage message)
     {
-        return message.ApplicationProperties.TryGetValue(ServiceNameProperty, out var value)
-            ? value?.ToString() ?? UnknownService
-            : UnknownService;
+        if (message.ApplicationProperties.TryGetValue(ServiceNameProperty, out var serviceNameObj) &&
+            serviceNameObj is string serviceName &&
+            !string.IsNullOrWhiteSpace(serviceName))
+        {
+            return serviceName;
+        }
+
+        logger.LogWarning("Service name not found in message properties, using default: {DefaultService}", UnknownService);
+        return UnknownService;
     }
 
     /// <summary>
@@ -213,7 +196,7 @@ public class FileScanner(
             cacheKey,
             async () =>
             {
-                logger.LogInformation("Cache miss - downloading and scanning file: {FileHash}", scanRequest.FileHash);
+                logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
                 return await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
             },
             nameof(FileScanner), cancellationToken);
@@ -227,7 +210,7 @@ public class FileScanner(
     }
 
     /// <summary>
-    /// Downloads and scans a file, creating a scan result event.
+    /// Performs the actual virus scan by calling the virus scanner service.
     /// </summary>
     private async Task<ScanResultEvent> PerformScanAsync(
         ScanRequestedEvent scanRequest,
@@ -255,7 +238,10 @@ public class FileScanner(
             );
         }
 
-        var scanResult = await ScanFileAsyncMethodAsync(scanRequest.FileUri, scanRequest.FileName, cancellationToken);
+        var scanResult = await virusScannerService.ScanFileByUrlAsync(
+            scanRequest.FileUri, 
+            scanRequest.FileName, 
+            cancellationToken);
 
         return new ScanResultEvent(
             FileId: scanRequest.FileId,
@@ -276,335 +262,47 @@ public class FileScanner(
     }
 
     /// <summary>
-    /// Scans a file using asynchronous scanning with polling (for large files).
-    /// </summary>
-    private async Task<VirusScanResult> ScanFileAsyncMethodAsync(
-        string fileUrl,
-        string fileName,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            var baseUrl = configuration[VirusScannerApiBaseUrlKey];
-            var asyncScanEndpoint = configuration[VirusScannerApiAsyncScanEndpointKey] ?? "/scan/async/url";
-            var versionEndpoint = configuration[VirusScannerApiVersionEndpointKey] ?? "/version";
-            
-            if (string.IsNullOrWhiteSpace(baseUrl))
-            {
-                logger.LogError("Virus scanner API base URL is not configured");
-                return new VirusScanResult
-                {
-                    Outcome = VirusScanOutcome.Error,
-                    MalwareName = null,
-                    ScannerVersion = "Unknown",
-                    Message = "Virus scanner API not configured"
-                };
-            }
-
-            logger.LogInformation("Submitting file for async scan: {FileName} using API: {BaseUrl}", 
-                fileName, baseUrl);
-
-            // Get scanner version
-            var scannerVersion = await GetScannerVersionAsync(baseUrl, versionEndpoint, cancellationToken);
-
-            // Encode the file URL to base64
-            var fileUrlBytes = Encoding.UTF8.GetBytes(fileUrl);
-            var base64EncodedUrl = Convert.ToBase64String(fileUrlBytes);
-
-            // Submit the file URL for async scanning
-            var scanUrl = $"{baseUrl.TrimEnd('/')}{asyncScanEndpoint}";
-            var payload = new
-            {
-                url = base64EncodedUrl,
-                isBase64 = true
-            };
-
-            var jsonPayload = JsonSerializer.Serialize(payload, JsonOptions);
-            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-            logger.LogInformation("Submitting URL scan request to: {ScanUrl}", scanUrl);
-
-            var submitResponse = await _httpClient.PostAsync(scanUrl, content, cancellationToken);
-            submitResponse.EnsureSuccessStatusCode();
-
-            var submitResponseBody = await submitResponse.Content.ReadAsStringAsync(cancellationToken);
-            var asyncSubmitResponse = JsonSerializer.Deserialize<AsyncScanSubmitResponse>(submitResponseBody, JsonOptions);
-
-            if (asyncSubmitResponse == null || string.IsNullOrWhiteSpace(asyncSubmitResponse.StatusUrl))
-            {
-                logger.LogError("Failed to parse async scan submission response or missing statusUrl");
-                return new VirusScanResult
-                {
-                    Outcome = VirusScanOutcome.Error,
-                    MalwareName = null,
-                    ScannerVersion = scannerVersion,
-                    Message = "Failed to submit file for async scanning"
-                };
-            }
-
-            logger.LogInformation(
-                "Scan job submitted successfully. JobId: {JobId}, Status: {Status}, StatusUrl: {StatusUrl}",
-                asyncSubmitResponse.JobId,
-                asyncSubmitResponse.Status,
-                asyncSubmitResponse.StatusUrl);
-
-            // Poll the status URL until scan is complete
-            var scanStatusResponse = await PollScanStatusAsync(baseUrl, asyncSubmitResponse.StatusUrl, cancellationToken);
-
-            if (scanStatusResponse == null)
-            {
-                logger.LogError("Failed to get scan results from polling (timeout or error)");
-                return new VirusScanResult
-                {
-                    Outcome = VirusScanOutcome.Error,
-                    MalwareName = null,
-                    ScannerVersion = scannerVersion,
-                    Message = "Scan polling timed out or failed"
-                };
-            }
-
-            // Process the final scan result
-            logger.LogInformation("Final scan result for {FileName}: {Status}", fileName, scanStatusResponse.Status);
-
-            var outcome = MapScanOutcome(scanStatusResponse.Status);
-            var message = outcome switch
-            {
-                VirusScanOutcome.Clean => $"File is clean. Engine: {scanStatusResponse.Engine}",
-                VirusScanOutcome.Infected => $"Malware detected: {scanStatusResponse.Malware}",
-                VirusScanOutcome.Error => $"Scan error: {scanStatusResponse.Raw ?? "Unknown error"}",
-                _ => "Scan completed"
-            };
-
-            return new VirusScanResult
-            {
-                Outcome = outcome,
-                MalwareName = scanStatusResponse.Malware,
-                ScannerVersion = scannerVersion,
-                Message = message
-            };
-        }
-        catch (HttpRequestException ex)
-        {
-            logger.LogError(ex, "HTTP error calling virus scanner API (async) for file: {FileName}", fileName);
-            return new VirusScanResult
-            {
-                Outcome = VirusScanOutcome.Error,
-                MalwareName = null,
-                ScannerVersion = "Unknown",
-                Message = $"Virus scanner API error: {ex.Message}"
-            };
-        }
-        catch (TaskCanceledException ex)
-        {
-            logger.LogError(ex, "Virus scan timeout (async) for file: {FileName}", fileName);
-            return new VirusScanResult
-            {
-                Outcome = VirusScanOutcome.Error,
-                MalwareName = null,
-                ScannerVersion = "Unknown",
-                Message = "Virus scan timeout"
-            };
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Error scanning file (async): {FileName}", fileName);
-            return new VirusScanResult
-            {
-                Outcome = VirusScanOutcome.Error,
-                MalwareName = null,
-                ScannerVersion = "Unknown",
-                Message = $"Scan failed: {ex.Message}"
-            };
-        }
-    }
-
-    /// <summary>
-    /// Gets the version of the virus scanner.
-    /// </summary>
-    private async Task<string> GetScannerVersionAsync(string baseUrl, string versionEndpoint, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var versionUrl = $"{baseUrl.TrimEnd('/')}{versionEndpoint}";
-            var response = await _httpClient.GetAsync(versionUrl, cancellationToken);
-            
-            if (!response.IsSuccessStatusCode)
-            {
-                logger.LogWarning("Failed to get scanner version. Status: {StatusCode}", response.StatusCode);
-                return "Unknown";
-            }
-
-            var versionBody = await response.Content.ReadAsStringAsync(cancellationToken);
-            var versionResponse = JsonSerializer.Deserialize<VirusScannerVersionResponse>(versionBody, JsonOptions);
-            
-            return versionResponse?.ClamavVersion ?? "Unknown";
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Error getting scanner version");
-            return "Unknown";
-        }
-    }
-
-    /// <summary>
-    /// Polls the scan status URL until the scan is complete or timeout occurs.
-    /// </summary>
-    private async Task<AsyncScanStatusResponse?> PollScanStatusAsync(
-        string baseUrl,
-        string statusUrl,
-        CancellationToken cancellationToken)
-    {
-        var pollingInterval = TimeSpan.FromSeconds(
-            configuration.GetValue<int?>(VirusScannerApiPollingIntervalSecondsKey) ?? DefaultPollingIntervalSeconds);
-        
-        var maxTimeout = TimeSpan.FromSeconds(
-            configuration.GetValue<int?>(VirusScannerApiMaxPollingTimeoutSecondsKey) ?? DefaultMaxPollingTimeoutSeconds);
-        
-        var fullStatusUrl = statusUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-            ? statusUrl
-            : $"{baseUrl.TrimEnd('/')}{statusUrl}";
-        
-        logger.LogInformation(
-            "Starting to poll scan status at: {StatusUrl} (interval: {Interval}s, timeout: {Timeout}s)",
-            fullStatusUrl,
-            pollingInterval.TotalSeconds,
-            maxTimeout.TotalSeconds);
-        
-        var startTime = DateTimeOffset.UtcNow;
-        var attempt = 0;
-        
-        while (true)
-        {
-            attempt++;
-            var elapsed = DateTimeOffset.UtcNow - startTime;
-            
-            // Check timeout
-            if (elapsed >= maxTimeout)
-            {
-                logger.LogError(
-                    "Polling timeout reached after {Elapsed}s and {Attempts} attempts",
-                    elapsed.TotalSeconds,
-                    attempt);
-                return null;
-            }
-            
-            try
-            {
-                logger.LogDebug("Polling attempt {Attempt} at {Elapsed}s", attempt, elapsed.TotalSeconds);
-                
-                var response = await _httpClient.GetAsync(fullStatusUrl, cancellationToken);
-                response.EnsureSuccessStatusCode();
-                
-                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                var statusResponse = JsonSerializer.Deserialize<AsyncScanStatusResponse>(responseBody, JsonOptions);
-                
-                if (statusResponse == null)
-                {
-                    logger.LogWarning("Failed to parse status response");
-                    return null;
-                }
-                
-                logger.LogInformation(
-                    "Poll attempt {Attempt}: Status = {Status}",
-                    attempt,
-                    statusResponse.Status);
-                
-                // Check if scan is complete
-                if (IsTerminalStatus(statusResponse.Status))
-                {
-                    logger.LogInformation(
-                        "Scan completed after {Elapsed}s and {Attempts} attempts with status: {Status}",
-                        elapsed.TotalSeconds,
-                        attempt,
-                        statusResponse.Status);
-                    return statusResponse;
-                }
-                
-                // Wait before next poll (not a terminal state, still queued/scanning)
-                await Task.Delay(pollingInterval, cancellationToken);
-            }
-            catch (HttpRequestException ex)
-            {
-                logger.LogError(ex, "HTTP error polling status URL: {StatusUrl}", fullStatusUrl);
-                return null;
-            }
-            catch (TaskCanceledException)
-            {
-                logger.LogWarning("Polling cancelled");
-                throw;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Unexpected error polling status");
-                return null;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Maps the API scan status to VirusScanOutcome enum.
-    /// ClamAV API returns: "clean", "infected", "error", "queued", "scanning"
-    /// </summary>
-    private static VirusScanOutcome MapScanOutcome(string? status)
-    {
-        return status?.ToLowerInvariant() switch
-        {
-            "clean" => VirusScanOutcome.Clean,
-            "infected" => VirusScanOutcome.Infected,
-            "error" => VirusScanOutcome.Error,
-            _ => VirusScanOutcome.Error  // Default to error for unexpected values
-        };
-    }
-    
-    /// <summary>
-    /// Checks if the scan status is a terminal state (scan complete).
-    /// </summary>
-    private static bool IsTerminalStatus(string? status)
-    {
-        return status?.ToLowerInvariant() switch
-        {
-            "clean" or "infected" or "error" => true,
-            _ => false
-        };
-    }
-
-    /// <summary>
-    /// Publishes the scan result event to the message bus.
+    /// Publishes the scan result event to the Service Bus topic.
     /// </summary>
     private async Task PublishResultAsync(
         ScanResultEvent scanResult,
         string serviceName,
         CancellationToken cancellationToken)
     {
+        logger.LogInformation(
+            "Publishing scan result for file {FileName}: {Outcome}",
+            scanResult.FileName,
+            scanResult.Outcome);
+
         var messageProperties = AzureServiceBusMessagePropertiesBuilder
             .Create()
             .AddCustomProperty(ServiceNameProperty, serviceName)
             .Build();
 
-        await eventPublisher.PublishAsync(scanResult, messageProperties, cancellationToken);
-        logger.LogInformation("Published scan result for file: {FileName}", scanResult.FileName);
+        await eventPublisher.PublishAsync(
+            scanResult,
+            messageProperties,
+            cancellationToken);
+
+        logger.LogInformation("Scan result published successfully");
     }
 
     /// <summary>
-    /// Sends the message to the dead-letter queue with diagnostic information.
+    /// Moves a message to the dead-letter queue with a reason.
     /// </summary>
     private async Task DeadLetterAsync(
-        ServiceBusMessageActions actions,
-            ServiceBusReceivedMessage message,
+        ServiceBusReceivedMessage message,
+        ServiceBusMessageActions messageActions,
         string reason,
-        string description,
         CancellationToken cancellationToken)
     {
         try
         {
-            await actions.DeadLetterMessageAsync(
+            await messageActions.DeadLetterMessageAsync(
                 message,
-                new Dictionary<string, object>
-                {
-                    { "DeadLetterReason", reason },
-                    { "DeadLetterErrorDescription", description }
-                },null,null,
-                cancellationToken);
+                new Dictionary<string, object> { { "Reason", reason } },
+                reason,
+                cancellationToken: cancellationToken);
 
             logger.LogWarning(
                 "Message {MessageId} moved to dead-letter queue. Reason: {Reason}",
@@ -615,86 +313,5 @@ public class FileScanner(
         {
             logger.LogError(ex, "Failed to dead-letter message {MessageId}", message.MessageId);
         }
-    }
-
-    // Private helper classes
-    private sealed class MessageWrapper
-    {
-        [JsonPropertyName("message")]
-        public ScanRequestedEvent? Message { get; init; }
-    }
-
-    private sealed class VirusScanResult
-    {
-        public required VirusScanOutcome Outcome { get; init; }
-        public string? MalwareName { get; init; }
-        public required string ScannerVersion { get; init; }
-        public string? Message { get; init; }
-    }
-
-    private sealed class VirusScanApiResponse
-    {
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
-        
-        [JsonPropertyName("engine")]
-        public string? Engine { get; init; }
-        
-        [JsonPropertyName("malware")]
-        public string? Malware { get; init; }
-        
-        [JsonPropertyName("fileName")]
-        public string? FileName { get; init; }
-        
-        [JsonPropertyName("size")]
-        public long? Size { get; init; }
-        
-        [JsonPropertyName("signatureDbTime")]
-        public DateTimeOffset? SignatureDbTime { get; init; }
-        
-        [JsonPropertyName("raw")]
-        public string? Raw { get; init; }
-    }
-
-    private sealed class VirusScannerVersionResponse
-    {
-        [JsonPropertyName("clamavVersion")]
-        public string? ClamavVersion { get; init; }
-    }
-
-    private sealed class AsyncScanSubmitResponse
-    {
-        [JsonPropertyName("jobId")]
-        public string? JobId { get; init; }
-        
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
-        
-        [JsonPropertyName("statusUrl")]
-        public string? StatusUrl { get; init; }
-    }
-
-    private sealed class AsyncScanStatusResponse
-    {
-        [JsonPropertyName("status")]
-        public string? Status { get; init; }
-        
-        [JsonPropertyName("engine")]
-        public string? Engine { get; init; }
-        
-        [JsonPropertyName("malware")]
-        public string? Malware { get; init; }
-        
-        [JsonPropertyName("fileName")]
-        public string? FileName { get; init; }
-        
-        [JsonPropertyName("size")]
-        public long? Size { get; init; }
-        
-        [JsonPropertyName("signatureDbTime")]
-        public DateTimeOffset? SignatureDbTime { get; init; }
-        
-        [JsonPropertyName("raw")]
-        public string? Raw { get; init; }
     }
 }

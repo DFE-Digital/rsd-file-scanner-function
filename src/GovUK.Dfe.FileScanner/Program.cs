@@ -1,6 +1,7 @@
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Entities.Topics;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Events;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Extensions;
+using GovUK.Dfe.FileScanner.Services;
 using MassTransit;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Configuration;
@@ -22,7 +23,6 @@ var host = new HostBuilder()
 
         var config = context.Configuration;
         
-        // Add HttpClient factory for file downloads
         services.AddHttpClient();
         
         services.AddDfEMassTransit(
