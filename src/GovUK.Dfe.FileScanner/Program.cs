@@ -24,7 +24,9 @@ var host = new HostBuilder()
         var config = context.Configuration;
         
         services.AddHttpClient();
-        
+
+        services.AddScoped<IVirusScannerService, VirusScannerService>();
+
         services.AddDfEMassTransit(
             config,
             configureConsumers: x =>
