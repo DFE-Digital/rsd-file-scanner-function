@@ -1,3 +1,6 @@
+using GovUK.Dfe.ClamAV.Api.Client;
+using GovUK.Dfe.ClamAV.Api.Client.Contracts;
+using GovUK.Dfe.ClamAV.Api.Client.Extensions;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Entities.Topics;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Events;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Extensions;
@@ -41,6 +44,8 @@ var host = new HostBuilder()
             });
 
         services.AddRedisCaching(config);
+
+        services.AddClamAvApiClient<IClamAvApiClient, ClamAvApiClient>(config);
 
     })
     .Build();

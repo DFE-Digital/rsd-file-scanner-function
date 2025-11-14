@@ -3,7 +3,7 @@ using GovUK.Dfe.FileScanner.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Text;
-using System.Text.Json;
+using GovUK.Dfe.ClamAV.Api.Client.Contracts;
 
 namespace GovUK.Dfe.FileScanner.Services;
 
@@ -13,28 +13,17 @@ namespace GovUK.Dfe.FileScanner.Services;
 public class VirusScannerService(
     ILogger<VirusScannerService> logger,
     IConfiguration configuration,
-    IHttpClientFactory httpClientFactory)
+    IClamAvApiClient clamAvApiClient)
     : IVirusScannerService
 {
-    private readonly HttpClient _httpClient = httpClientFactory.CreateClient();
-
     // Configuration keys
     private const string VirusScannerApiBaseUrlKey = "VirusScannerApi:BaseUrl";
-    private const string VirusScannerApiAsyncScanUrlEndpointKey = "VirusScannerApi:AsyncScanUrlEndpoint";
-    private const string VirusScannerApiVersionEndpointKey = "VirusScannerApi:VersionEndpoint";
     private const string VirusScannerApiPollingIntervalSecondsKey = "VirusScannerApi:PollingIntervalSeconds";
     private const string VirusScannerApiMaxPollingTimeoutSecondsKey = "VirusScannerApi:MaxPollingTimeoutSeconds";
     
     // Default values for scanning
     private const int DefaultPollingIntervalSeconds = 5;
     private const int DefaultMaxPollingTimeoutSeconds = 300; // 5 minutes
-
-    // Static configuration
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
 
     /// <inheritdoc/>
     public async Task<VirusScanResult> ScanFileByUrlAsync(
@@ -45,8 +34,6 @@ public class VirusScannerService(
         try
         {
             var baseUrl = configuration[VirusScannerApiBaseUrlKey];
-            var asyncScanEndpoint = configuration[VirusScannerApiAsyncScanUrlEndpointKey] ?? "/scan/async/url";
-            var versionEndpoint = configuration[VirusScannerApiVersionEndpointKey] ?? "/version";
             
             if (string.IsNullOrWhiteSpace(baseUrl))
             {
@@ -64,30 +51,20 @@ public class VirusScannerService(
                 fileName, baseUrl);
 
             // Get scanner version
-            var scannerVersion = await GetScannerVersionAsync(baseUrl, versionEndpoint, cancellationToken);
+            var scannerVersion = await GetScannerVersionAsync(cancellationToken);
 
             // Encode the file URL to base64
             var fileUrlBytes = Encoding.UTF8.GetBytes(fileUrl);
             var base64EncodedUrl = Convert.ToBase64String(fileUrlBytes);
 
             // Submit the file URL for async scanning
-            var scanUrl = $"{baseUrl.TrimEnd('/')}{asyncScanEndpoint}";
-            var payload = new
+            var payload = new ScanUrlRequest
             {
-                url = base64EncodedUrl,
-                isBase64 = true
+                Url = base64EncodedUrl,
+                IsBase64 = true
             };
 
-            var jsonPayload = JsonSerializer.Serialize(payload, JsonOptions);
-            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-            logger.LogInformation("Submitting URL scan request to: {ScanUrl}", scanUrl);
-
-            var submitResponse = await _httpClient.PostAsync(scanUrl, content, cancellationToken);
-            submitResponse.EnsureSuccessStatusCode();
-
-            var submitResponseBody = await submitResponse.Content.ReadAsStringAsync(cancellationToken);
-            var asyncSubmitResponse = JsonSerializer.Deserialize<AsyncScanSubmitResponse>(submitResponseBody, JsonOptions);
+            var asyncSubmitResponse = await clamAvApiClient.ScanAsyncUrlAsync(payload, cancellationToken);
 
             if (asyncSubmitResponse == null || string.IsNullOrWhiteSpace(asyncSubmitResponse.StatusUrl))
             {
@@ -108,7 +85,7 @@ public class VirusScannerService(
                 asyncSubmitResponse.StatusUrl);
 
             // Poll the status URL until scan is complete
-            var scanStatusResponse = await PollScanStatusAsync(baseUrl, asyncSubmitResponse.StatusUrl, cancellationToken);
+            var scanStatusResponse = await PollScanStatusAsync(asyncSubmitResponse.JobId, cancellationToken);
 
             if (scanStatusResponse == null)
             {
@@ -180,23 +157,13 @@ public class VirusScannerService(
     /// <summary>
     /// Gets the version of the virus scanner.
     /// </summary>
-    private async Task<string> GetScannerVersionAsync(string baseUrl, string versionEndpoint, CancellationToken cancellationToken)
+    private async Task<string> GetScannerVersionAsync(CancellationToken cancellationToken)
     {
         try
         {
-            var versionUrl = $"{baseUrl.TrimEnd('/')}{versionEndpoint}";
-            var response = await _httpClient.GetAsync(versionUrl, cancellationToken);
-            
-            if (!response.IsSuccessStatusCode)
-            {
-                logger.LogWarning("Failed to get scanner version. Status: {StatusCode}", response.StatusCode);
-                return "Unknown";
-            }
+            var versionResponse = await clamAvApiClient.GetVersionAsync(cancellationToken);
 
-            var versionBody = await response.Content.ReadAsStringAsync(cancellationToken);
-            var versionResponse = JsonSerializer.Deserialize<VirusScannerVersionResponse>(versionBody, JsonOptions);
-            
-            return versionResponse?.ClamavVersion ?? "Unknown";
+            return versionResponse?.ClamAvVersion ?? "Unknown";
         }
         catch (Exception ex)
         {
@@ -208,10 +175,7 @@ public class VirusScannerService(
     /// <summary>
     /// Polls the scan status URL until the scan is complete or timeout occurs.
     /// </summary>
-    private async Task<AsyncScanStatusResponse?> PollScanStatusAsync(
-        string baseUrl,
-        string statusUrl,
-        CancellationToken cancellationToken)
+    private async Task<AsyncScanStatusResponse?> PollScanStatusAsync(string jobId, CancellationToken cancellationToken)
     {
         var pollingInterval = TimeSpan.FromSeconds(
             configuration.GetValue<int?>(VirusScannerApiPollingIntervalSecondsKey) ?? DefaultPollingIntervalSeconds);
@@ -219,13 +183,9 @@ public class VirusScannerService(
         var maxTimeout = TimeSpan.FromSeconds(
             configuration.GetValue<int?>(VirusScannerApiMaxPollingTimeoutSecondsKey) ?? DefaultMaxPollingTimeoutSeconds);
         
-        var fullStatusUrl = statusUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-            ? statusUrl
-            : $"{baseUrl.TrimEnd('/')}{statusUrl}";
         
         logger.LogInformation(
-            "Starting to poll scan status at: {StatusUrl} (interval: {Interval}s, timeout: {Timeout}s)",
-            fullStatusUrl,
+            "Starting to poll scan status (interval: {Interval}s, timeout: {Timeout}s)",
             pollingInterval.TotalSeconds,
             maxTimeout.TotalSeconds);
         
@@ -251,12 +211,8 @@ public class VirusScannerService(
             {
                 logger.LogDebug("Polling attempt {Attempt} at {Elapsed}s", attempt, elapsed.TotalSeconds);
                 
-                var response = await _httpClient.GetAsync(fullStatusUrl, cancellationToken);
-                response.EnsureSuccessStatusCode();
-                
-                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                var statusResponse = JsonSerializer.Deserialize<AsyncScanStatusResponse>(responseBody, JsonOptions);
-                
+                var statusResponse = await clamAvApiClient.GetScanStatusAsync(jobId, cancellationToken);
+
                 if (statusResponse == null)
                 {
                     logger.LogWarning("Failed to parse status response");
@@ -276,7 +232,14 @@ public class VirusScannerService(
                         elapsed.TotalSeconds,
                         attempt,
                         statusResponse.Status);
-                    return statusResponse;
+
+                    return new AsyncScanStatusResponse
+                    {
+                        Status = statusResponse.Status,
+                        Engine = statusResponse.Engine,
+                        Malware = statusResponse.Malware,
+                        FileName = statusResponse.FileName,
+                    };
                 }
                 
                 // Wait before next poll (not a terminal state, still queued/scanning)
@@ -284,7 +247,7 @@ public class VirusScannerService(
             }
             catch (HttpRequestException ex)
             {
-                logger.LogError(ex, "HTTP error polling status URL: {StatusUrl}", fullStatusUrl);
+                logger.LogError(ex, "HTTP error polling status JobId: {jobId}", jobId);
                 return null;
             }
             catch (TaskCanceledException)
