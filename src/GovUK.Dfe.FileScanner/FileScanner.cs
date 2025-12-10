@@ -179,6 +179,7 @@ public class FileScanner(
 
     /// <summary>
     /// Processes the scan request with Redis caching to avoid duplicate scans.
+    /// Only caches successful scan results (non-error outcomes).
     /// </summary>
     private async Task<ScanResultEvent> ProcessScanWithCacheAsync(
         ScanRequestedEvent scanRequest,
@@ -192,21 +193,43 @@ public class FileScanner(
 
         await Task.Delay(5000, cancellationToken);
 
-        var result = await cacheService.GetOrAddAsync(
-            cacheKey,
-            async () =>
-            {
-                logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
-                return await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
-            },
-            nameof(FileScanner), cancellationToken);
+        ScanResultEvent? errorResult = null;
 
-        logger.LogInformation(
-            "Scan result retrieved (cached: {IsCached}) for hash: {FileHash}",
-            result != null,
-            scanRequest.FileHash);
+        try
+        {
+            var result = await cacheService.GetOrAddAsync(
+                cacheKey,
+                async () =>
+                {
+                    logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
+                    var scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
 
-        return result;
+                    if (scanResult.Outcome == VirusScanOutcome.Error)
+                    {
+                        // Store error result and throw to prevent caching
+                        errorResult = scanResult;
+                        throw new InvalidOperationException("Scan error - result will not be cached");
+                    }
+
+                    return scanResult;
+                },
+                nameof(FileScanner), cancellationToken);
+
+            logger.LogInformation(
+                "Scan result retrieved for hash: {FileHash}",
+                scanRequest.FileHash);
+
+            return result;
+        }
+        catch (InvalidOperationException) when (errorResult != null)
+        {
+            logger.LogWarning(
+                "Scan result not cached due to error outcome for hash: {FileHash}. Message: {Message}",
+                scanRequest.FileHash,
+                errorResult.Message);
+
+            return errorResult;
+        }
     }
 
     /// <summary>
