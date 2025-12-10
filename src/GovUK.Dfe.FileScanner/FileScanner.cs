@@ -193,43 +193,50 @@ public class FileScanner(
 
         await Task.Delay(5000, cancellationToken);
 
-        ScanResultEvent? errorResult = null;
+        logger.LogWarning(">>>>>> CODE VERSION: 2024-12-10-V3 <<<<<<");
 
-        try
+        // First, check if we have a cached result
+        var cachedResult = await cacheService.GetAsync<ScanResultEvent>(cacheKey);
+        if (cachedResult != null)
         {
-            var result = await cacheService.GetOrAddAsync(
-                cacheKey,
-                async () =>
-                {
-                    logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
-                    var scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
-
-                    if (scanResult.Outcome == VirusScanOutcome.Error)
-                    {
-                        // Store error result and throw to prevent caching
-                        errorResult = scanResult;
-                        throw new InvalidOperationException("Scan error - result will not be cached");
-                    }
-
-                    return scanResult;
-                },
-                nameof(FileScanner), cancellationToken);
-
             logger.LogInformation(
-                "Scan result retrieved for hash: {FileHash}",
-                scanRequest.FileHash);
-
-            return result;
+                "Cache hit for hash: {FileHash}, Outcome: {Outcome}",
+                scanRequest.FileHash,
+                cachedResult.Outcome);
+            return cachedResult;
         }
-        catch (InvalidOperationException) when (errorResult != null)
+
+        // Cache miss - perform the scan
+        logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
+        var scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
+
+        logger.LogInformation(
+            "Scan completed for hash: {FileHash}, Outcome: {Outcome}, Message: {Message}",
+            scanRequest.FileHash,
+            scanResult.Outcome,
+            scanResult.Message);
+
+        // Only cache successful results (not errors)
+        if (scanResult.Outcome != VirusScanOutcome.Error)
+        {
+            // Use GetOrAddAsync to cache - factory just returns our already-computed result
+            await cacheService.GetOrAddAsync(
+                cacheKey,
+                () => Task.FromResult(scanResult),
+                nameof(FileScanner),
+                cancellationToken);
+
+            logger.LogInformation("Result cached for hash: {FileHash}", scanRequest.FileHash);
+        }
+        else
         {
             logger.LogWarning(
-                "Scan result not cached due to error outcome for hash: {FileHash}. Message: {Message}",
+                "Result NOT cached due to error for hash: {FileHash}. Message: {Message}",
                 scanRequest.FileHash,
-                errorResult.Message);
-
-            return errorResult;
+                scanResult.Message);
         }
+
+        return scanResult;
     }
 
     /// <summary>
