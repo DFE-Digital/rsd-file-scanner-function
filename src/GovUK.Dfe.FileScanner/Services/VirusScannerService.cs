@@ -17,7 +17,7 @@ public class VirusScannerService(
     : IVirusScannerService
 {
     // Configuration keys
-    private const string VirusScannerApiBaseUrlKey = "VirusScannerApi:BaseUrl";
+    private const string VirusScannerApiBaseUrlKey = "ClamAvApiClient:BaseUrl";
     private const string VirusScannerApiPollingIntervalSecondsKey = "VirusScannerApi:PollingIntervalSeconds";
     private const string VirusScannerApiMaxPollingTimeoutSecondsKey = "VirusScannerApi:MaxPollingTimeoutSeconds";
     
