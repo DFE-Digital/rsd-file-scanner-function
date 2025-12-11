@@ -193,7 +193,7 @@ public class FileScanner(
 
         await Task.Delay(5000, cancellationToken);
 
-        logger.LogWarning(">>>>>> CODE VERSION: 2024-12-10-V3 <<<<<<");
+        logger.LogWarning(">>>>>> CODE VERSION: 2024-12-10-V4 <<<<<<");
 
         // First, check if we have a cached result
         var cachedResult = await cacheService.GetAsync<ScanResultEvent>(cacheKey);
@@ -208,13 +208,43 @@ public class FileScanner(
 
         // Cache miss - perform the scan
         logger.LogInformation("Cache miss - scanning file: {FileHash}", scanRequest.FileHash);
-        var scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
-
-        logger.LogInformation(
-            "Scan completed for hash: {FileHash}, Outcome: {Outcome}, Message: {Message}",
-            scanRequest.FileHash,
-            scanResult.Outcome,
-            scanResult.Message);
+        
+        ScanResultEvent scanResult;
+        try
+        {
+            scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
+            
+            logger.LogInformation(
+                "Scan completed for hash: {FileHash}, Outcome: {Outcome}, Message: {Message}",
+                scanRequest.FileHash,
+                scanResult.Outcome,
+                scanResult.Message);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex,
+                "Exception during PerformScanAsync for hash: {FileHash}. Error: {ErrorMessage}",
+                scanRequest.FileHash,
+                ex.Message);
+            
+            // Create an error result so we can still return something
+            scanResult = new ScanResultEvent(
+                FileId: scanRequest.FileId,
+                FileName: scanRequest.FileName,
+                Reference: scanRequest.Reference,
+                Path: scanRequest.Path,
+                IsAzureFileShare: scanRequest.IsAzureFileShare,
+                FileUri: scanRequest.FileUri,
+                ServiceName: serviceName,
+                CorrelationId: correlationId,
+                Outcome: VirusScanOutcome.Error,
+                MalwareName: null,
+                ScannedAt: DateTimeOffset.UtcNow,
+                ScannerVersion: "Unknown",
+                Message: $"Scan exception: {ex.Message}",
+                Metadata: scanRequest.Metadata
+            );
+        }
 
         // Only cache successful results (not errors)
         if (scanResult.Outcome != VirusScanOutcome.Error)
