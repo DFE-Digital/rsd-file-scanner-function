@@ -3,7 +3,6 @@ using GovUK.Dfe.CoreLibs.Caching.Interfaces;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Enums;
 using GovUK.Dfe.CoreLibs.Messaging.Contracts.Messages.Events;
 using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Interfaces;
-using GovUK.Dfe.CoreLibs.Messaging.MassTransit.Models;
 using GovUK.Dfe.FileScanner.Models;
 using GovUK.Dfe.FileScanner.Services;
 using Microsoft.Azure.Functions.Worker;
@@ -24,7 +23,6 @@ public class FileScanner(
     IConfiguration configuration)
 {
     // Constants
-    private const string ServiceNameProperty = "serviceName";
     private const string UnknownService = "unknown";
     private const string CacheKeyPrefix = "file-scan-result";
     private const string TestFileName = "da279850ec326ffabd3e5b2970b0af4c.jpg";
@@ -75,17 +73,17 @@ public class FileScanner(
                 return; // Already dead-lettered
             }
 
-            var serviceName = ExtractServiceName(message);
+            var routing = ScanResultRouting.FromInbound(message, scanRequest, UnknownService);
 
             // Process scan with caching
             var scanResult = await ProcessScanWithCacheAsync(
-                scanRequest, 
-                serviceName, 
-                message.CorrelationId, 
+                scanRequest,
+                routing,
+                message.CorrelationId,
                 cancellationToken);
 
             // Publish result
-            await PublishResultAsync(scanResult, serviceName, cancellationToken);
+            await PublishResultAsync(scanResult, routing, cancellationToken);
 
             // Complete message
             await messageActions.CompleteMessageAsync(message, cancellationToken);
@@ -162,28 +160,12 @@ public class FileScanner(
     }
 
     /// <summary>
-    /// Extracts the service name from message application properties.
-    /// </summary>
-    private string ExtractServiceName(ServiceBusReceivedMessage message)
-    {
-        if (message.ApplicationProperties.TryGetValue(ServiceNameProperty, out var serviceNameObj) &&
-            serviceNameObj is string serviceName &&
-            !string.IsNullOrWhiteSpace(serviceName))
-        {
-            return serviceName;
-        }
-
-        logger.LogWarning("Service name not found in message properties, using default: {DefaultService}", UnknownService);
-        return UnknownService;
-    }
-
-    /// <summary>
     /// Processes the scan request with Redis caching to avoid duplicate scans.
     /// Only caches successful scan results (non-error outcomes).
     /// </summary>
     private async Task<ScanResultEvent> ProcessScanWithCacheAsync(
         ScanRequestedEvent scanRequest,
-        string serviceName,
+        ScanResultRouting.Values routing,
         string? correlationId,
         CancellationToken cancellationToken)
     {
@@ -203,7 +185,7 @@ public class FileScanner(
                 "Cache hit for hash: {FileHash}, Outcome: {Outcome}",
                 scanRequest.FileHash,
                 cachedResult.Outcome);
-            return cachedResult;
+            return ScanResultRouting.ForRequester(cachedResult, scanRequest, routing, correlationId);
         }
 
         // Cache miss - perform the scan
@@ -212,7 +194,7 @@ public class FileScanner(
         ScanResultEvent scanResult;
         try
         {
-            scanResult = await PerformScanAsync(scanRequest, serviceName, correlationId, cancellationToken);
+            scanResult = await PerformScanAsync(scanRequest, routing.ServiceName, correlationId, cancellationToken);
             
             logger.LogInformation(
                 "Scan completed for hash: {FileHash}, Outcome: {Outcome}, Message: {Message}",
@@ -235,7 +217,7 @@ public class FileScanner(
                 Path: scanRequest.Path,
                 IsAzureFileShare: scanRequest.IsAzureFileShare,
                 FileUri: scanRequest.FileUri,
-                ServiceName: serviceName,
+                ServiceName: routing.ServiceName,
                 CorrelationId: correlationId,
                 Outcome: VirusScanOutcome.Error,
                 MalwareName: null,
@@ -326,22 +308,20 @@ public class FileScanner(
     /// </summary>
     private async Task PublishResultAsync(
         ScanResultEvent scanResult,
-        string serviceName,
+        ScanResultRouting.Values routing,
         CancellationToken cancellationToken)
     {
         logger.LogInformation(
-            "Publishing scan result for file {FileName}: {Outcome}",
+            "Publishing scan result for file {FileName}: {Outcome} (TenantId: {TenantId}, TemplateId: {TemplateId}, UserId: {UserId})",
             scanResult.FileName,
-            scanResult.Outcome);
-
-        var messageProperties = AzureServiceBusMessagePropertiesBuilder
-            .Create()
-            .AddCustomProperty(ServiceNameProperty, serviceName)
-            .Build();
+            scanResult.Outcome,
+            routing.TenantId,
+            routing.TemplateId,
+            routing.UserId);
 
         await eventPublisher.PublishAsync(
             scanResult,
-            messageProperties,
+            ScanResultRouting.ToMessageProperties(routing),
             cancellationToken);
 
         logger.LogInformation("Scan result published successfully");
