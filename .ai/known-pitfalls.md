@@ -7,3 +7,4 @@
 - Hash cache: identical bytes skip ClamAV (cost vs “must always rescan” policy).
 - Abandon on generic errors → retries; poison after max delivery.
 - Missing `ClamAvApiClient` in template → easy local misconfig.
+- A ClamAV `404` on status poll used to become an immediate `Error` result. It is now retried until the polling timeout, so a genuinely lost job (ClamAV restart, expired job) shows up as a timeout after `MaxPollingTimeoutSeconds` instead.
