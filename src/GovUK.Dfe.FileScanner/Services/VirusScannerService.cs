@@ -245,6 +245,16 @@ public class VirusScannerService(
                 // Wait before next poll (not a terminal state, still queued/scanning)
                 await Task.Delay(pollingInterval, cancellationToken);
             }
+            catch (ClamAvApiException ex) when (ex.StatusCode == 404)
+            {
+                // A ClamAV replica without the shared job store does not know jobs created on another replica.
+                // Keep polling: a later poll can reach the right one, and the timeout above still applies.
+                logger.LogWarning(
+                    "Scan job {JobId} not found on attempt {Attempt}; retrying until the polling timeout",
+                    jobId,
+                    attempt);
+                await Task.Delay(pollingInterval, cancellationToken);
+            }
             catch (HttpRequestException ex)
             {
                 logger.LogError(ex, "HTTP error polling status JobId: {jobId}", jobId);
