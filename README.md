@@ -160,7 +160,7 @@ You can run the Function locally using **Azure Functions Core Tools**.
 
 ### Prerequisites
 
-- .NET 8 SDK  
+- .NET 10 SDK  
 - Azure Functions Core Tools  
 - Docker (for ClamAV API)  
 - Running instance of the ClamAV API container  

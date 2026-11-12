@@ -1,6 +1,6 @@
 # rsd-file-scanner-function — Agent entry point
 
-Azure Functions v4 **.NET 8 isolated** worker. Consumes `ScanRequestedEvent` from `file-scanner-requests`, calls ClamAV API, publishes `ScanResultEvent` to `file-scanner-results`.
+Azure Functions v4 **.NET 10 isolated** worker. Consumes `ScanRequestedEvent` from `file-scanner-requests`, calls ClamAV API, publishes `ScanResultEvent` to `file-scanner-results`.
 
 Contracts live in **CoreLibs.Messaging.Contracts**, not this repo.
 
