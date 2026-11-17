@@ -11,13 +11,13 @@ Contracts live in **CoreLibs.Messaging.Contracts**, not this repo.
 3. Copy tenant/template/user headers via `ScanResultRouting.FromInbound`. FlexForms consumers match in code, not SQL filters.
 4. `host.json`: `autoCompleteMessages: false`. Complete/abandon/dead-letter explicitly.
 5. Config: API URL/auth is `ClamAvApiClient:*`. Polling is `VirusScannerApi:PollingIntervalSeconds` / `MaxPollingTimeoutSeconds`. README keys are partly stale (`RESULTS_TOPIC_NAME`, `BaseUrl`, `PollingTimeoutSeconds`).
-6. **No GitHub workflows** except CODEOWNERS. **No Terraform.** Deployment is external/unverified.
-7. **No tests.** Hard-coded filename `da279850ec326ffabd3e5b2970b0af4c.jpg` fakes infection — don’t remove without replacing the test strategy.
+6. **No build or deploy workflows** — only `knowledge-check.yml` (PR docs gate) plus CODEOWNERS. **No Terraform.** Deployment is external/unverified.
+7. **No tests.** `FileScanner.cs` contains a test hook used by end-to-end infection tests — don’t remove it without replacing the test strategy.
 8. There is a `Task.Delay(5000)` before cache lookup in `FileScanner.cs` — latency on every message; don’t “clean up” without finding out why it was added (rationale not recorded).
 
 ## Knowledge map
 
-[`.ai/architecture.md`](.ai/architecture.md) · [`.ai/integrations.md`](.ai/integrations.md) · [`.ai/known-pitfalls.md`](.ai/known-pitfalls.md) · [`.ai/features/scan-worker.md`](.ai/features/scan-worker.md) · [`.ai/history-lessons.md`](.ai/history-lessons.md)
+[`.ai/ecosystem.md`](.ai/ecosystem.md) (whole platform, same file in all six repos) · [`.ai/architecture.md`](.ai/architecture.md) (code map) · [`.ai/integrations.md`](.ai/integrations.md) · [`.ai/known-pitfalls.md`](.ai/known-pitfalls.md) · [`.ai/features/scan-worker.md`](.ai/features/scan-worker.md) · [`.ai/history-lessons.md`](.ai/history-lessons.md)
 
 ## Knowledge maintenance
 
